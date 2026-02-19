@@ -1,18 +1,128 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from mangum import Mangum
 import httpx
 import os
 import json
 from pydantic import BaseModel
+from typing import Optional
 
+# Vercel natively supports FastAPI — just expose 'app', no Mangum needed
 app = FastAPI(title="Synapse AI Search")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 DDGO_URL = "https://api.duckduckgo.com/"
 
-HTML = r"""<!DOCTYPE html>
+# ── MODELS ────────────────────────────────────────────────────────────────────
+class SearchRequest(BaseModel):
+    query: str
+
+class ScoreRequest(BaseModel):
+    query: str
+    ai_answer: str
+    expected_answer: str
+
+# ── HELPERS ──────────────────────────────────────────────────────────────────
+async def web_search(query: str) -> str:
+    params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(DDGO_URL, params=params)
+            data = r.json()
+            snippets = []
+            if data.get("AbstractText"):
+                snippets.append(data["AbstractText"])
+            for topic in data.get("RelatedTopics", [])[:5]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    snippets.append(topic["Text"])
+            return "\n".join(snippets) if snippets else "No web results found."
+        except Exception as e:
+            return f"Web search error: {str(e)}"
+
+
+async def call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "Error: GEMINI_API_KEY is not set. Go to Vercel Dashboard → Settings → Environment Variables → add GEMINI_API_KEY → Redeploy."
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                headers=headers,
+                json=body
+            )
+            data = r.json()
+            if "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            elif "error" in data:
+                return f"Gemini Error: {data['error'].get('message', 'Unknown error')}"
+            return "No response from Gemini."
+        except Exception as e:
+            return f"Request failed: {str(e)}"
+
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTMLResponse(content=get_html())
+
+
+@app.post("/search")
+async def search(req: SearchRequest):
+    web_context = await web_search(req.query)
+    prompt = f"""You are a helpful AI assistant with access to web search results.
+
+Web Search Context:
+{web_context}
+
+User Question: {req.query}
+
+Provide a comprehensive, accurate answer. Be concise but complete. Write in clear paragraphs."""
+    ai_answer = await call_gemini(prompt)
+    return JSONResponse({"ai_answer": ai_answer, "web_context": web_context, "query": req.query})
+
+
+@app.post("/score")
+async def score(req: ScoreRequest):
+    prompt = f"""You are an expert answer evaluator.
+
+Question: {req.query}
+AI Answer: {req.ai_answer}
+User Expected: {req.expected_answer}
+
+Score on 4 dimensions (each 0-25): Factual Accuracy, Completeness, Relevance, Clarity.
+Reply ONLY with JSON, no markdown:
+{{"total_score":0,"factual_accuracy":0,"completeness":0,"relevance":0,"clarity":0,"verdict":"Good","feedback":"2-3 sentences here","matches_expected":false}}"""
+
+    raw = await call_gemini(prompt)
+    try:
+        clean = raw.strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+        return JSONResponse(json.loads(clean.strip()))
+    except Exception:
+        return JSONResponse({
+            "total_score": 50, "factual_accuracy": 13, "completeness": 13,
+            "relevance": 12, "clarity": 12, "verdict": "Acceptable",
+            "feedback": "Could not parse score details. Try again.",
+            "matches_expected": False
+        })
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "gemini_configured": bool(GEMINI_API_KEY)}
+
+
+# ── HTML (inlined - no file path issues on serverless) ───────────────────────
+def get_html():
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -23,42 +133,66 @@ HTML = r"""<!DOCTYPE html>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0a0a0f;--surface:#111118;--surface2:#1a1a24;--border:#ffffff12;--accent:#7c6dff;--accent2:#ff6b9d;--accent3:#00d4aa;--text:#e8e8f0;--muted:#6b6b80;--danger:#ff4d6d}
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM Mono',monospace;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(ellipse 80% 60% at 20% 10%,#7c6dff18 0%,transparent 60%),radial-gradient(ellipse 60% 50% at 80% 80%,#ff6b9d12 0%,transparent 60%)}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse 80% 60% at 20% 10%,#7c6dff18 0%,transparent 60%),
+             radial-gradient(ellipse 60% 50% at 80% 80%,#ff6b9d12 0%,transparent 60%)}
 .wrap{position:relative;z-index:1;max-width:860px;margin:0 auto;padding:0 24px}
 header{padding:40px 0 20px}
-.logo{font-family:'Syne',sans-serif;font-size:28px;font-weight:800;letter-spacing:-1px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.logo span{font-size:13px;color:var(--muted);-webkit-text-fill-color:var(--muted);font-family:'DM Mono',monospace;margin-left:8px;vertical-align:middle}
+.logo{font-family:'Syne',sans-serif;font-size:28px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo span{font-size:13px;color:var(--muted);-webkit-text-fill-color:var(--muted);
+  font-family:'DM Mono',monospace;margin-left:8px;vertical-align:middle}
 .tag{font-size:11px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-top:4px}
 .sw{margin:48px 0 40px}
-.sb{display:flex;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:16px;transition:border-color .3s,box-shadow .3s;overflow:hidden}
+.sb{display:flex;align-items:center;background:var(--surface);border:1px solid var(--border);
+  border-radius:16px;transition:border-color .3s,box-shadow .3s;overflow:hidden}
 .sb:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px #7c6dff20}
 .si{padding:0 16px 0 20px;color:var(--muted);font-size:18px}
-#q{flex:1;background:transparent;border:none;outline:none;font-family:'DM Mono',monospace;font-size:15px;color:var(--text);padding:20px 0;caret-color:var(--accent)}
+#q{flex:1;background:transparent;border:none;outline:none;font-family:'DM Mono',monospace;
+  font-size:15px;color:var(--text);padding:20px 0;caret-color:var(--accent)}
 #q::placeholder{color:var(--muted)}
-.sbtn{margin:8px;padding:12px 24px;background:linear-gradient(135deg,var(--accent),#9b8aff);border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap}
+.sbtn{margin:8px;padding:12px 24px;background:linear-gradient(135deg,var(--accent),#9b8aff);
+  border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-size:13px;
+  font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap}
 .sbtn:hover{transform:translateY(-1px);box-shadow:0 8px 25px #7c6dff40}
 .sbtn:disabled{opacity:.5;cursor:not-allowed;transform:none}
 .tabs{display:none}.tabs.on{display:block}
-.tbar{display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:4px;margin-bottom:20px;width:fit-content}
-.tb{padding:10px 22px;border-radius:8px;border:none;background:transparent;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .25s}
+.tbar{display:flex;gap:4px;background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;padding:4px;margin-bottom:20px;width:fit-content}
+.tb{padding:10px 22px;border-radius:8px;border:none;background:transparent;color:var(--muted);
+  font-family:'DM Mono',monospace;font-size:12px;cursor:pointer;transition:all .25s}
 .tb.on{background:var(--surface2);color:var(--text);box-shadow:0 2px 12px #00000040}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:8px;background:var(--accent);vertical-align:middle}
-.tb:nth-child(2) .dot{background:var(--accent2)}.tb:nth-child(3) .dot{background:var(--accent3)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:8px;
+  background:var(--accent);vertical-align:middle}
+.tb:nth-child(2) .dot{background:var(--accent2)}
+.tb:nth-child(3) .dot{background:var(--accent3)}
 .tp{display:none}.tp.on{display:block}
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;margin-bottom:16px}
-.pl{font-family:'Syne',sans-serif;font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:16px;
+  padding:28px;margin-bottom:16px}
+.pl{font-family:'Syne',sans-serif;font-size:11px;font-weight:600;letter-spacing:2px;
+  text-transform:uppercase;color:var(--muted);margin-bottom:16px;
+  display:flex;align-items:center;gap:8px}
 .pl::before{content:'';display:inline-block;width:20px;height:1px;background:var(--accent)}
-.ti{display:none;gap:4px;padding:20px 0;align-items:center}.ti.on{display:flex}
+.ti{display:none;gap:4px;padding:20px 0;align-items:center}
+.ti.on{display:flex}
 .ti span{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:bounce 1.2s infinite}
-.ti span:nth-child(2){animation-delay:.2s}.ti span:nth-child(3){animation-delay:.4s;background:var(--accent2)}
+.ti span:nth-child(2){animation-delay:.2s}
+.ti span:nth-child(3){animation-delay:.4s;background:var(--accent2)}
 .ti .lbl{margin-left:10px;font-size:12px;color:var(--muted)}
-.badge{display:inline-flex;align-items:center;gap:6px;background:#7c6dff15;border:1px solid #7c6dff30;border-radius:20px;padding:4px 12px;font-size:11px;color:var(--accent);margin-bottom:16px}
+.badge{display:inline-flex;align-items:center;gap:6px;background:#7c6dff15;
+  border:1px solid #7c6dff30;border-radius:20px;padding:4px 12px;
+  font-size:11px;color:var(--accent);margin-bottom:16px}
 .ans{line-height:1.8;font-size:14px;color:var(--text);white-space:pre-wrap;word-break:break-word}
 .ctx{font-size:12px;color:var(--muted);line-height:1.7;max-height:200px;overflow-y:auto;white-space:pre-wrap}
-textarea{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;color:var(--text);font-family:'DM Mono',monospace;font-size:13px;line-height:1.7;resize:vertical;min-height:140px;outline:none;transition:border-color .3s}
+textarea{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:12px;
+  padding:16px;color:var(--text);font-family:'DM Mono',monospace;font-size:13px;
+  line-height:1.7;resize:vertical;min-height:140px;outline:none;transition:border-color .3s}
 textarea:focus{border-color:var(--accent2)}
 textarea::placeholder{color:var(--muted)}
-.scbtn{margin-top:16px;padding:14px 32px;width:100%;background:linear-gradient(135deg,var(--accent2),#ff8fab);border:none;border-radius:10px;color:#fff;font-family:'Syne',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s}
+.scbtn{margin-top:16px;padding:14px 32px;width:100%;
+  background:linear-gradient(135deg,var(--accent2),#ff8fab);border:none;border-radius:10px;
+  color:#fff;font-family:'Syne',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s}
 .scbtn:hover{transform:translateY(-1px);box-shadow:0 8px 25px #ff6b9d40}
 .scbtn:disabled{opacity:.4;cursor:not-allowed;transform:none}
 .sd{display:none}.sd.on{display:block}
@@ -66,10 +200,13 @@ textarea::placeholder{color:var(--muted)}
 .sc{position:relative;width:110px;height:110px;flex-shrink:0}
 .sc svg{transform:rotate(-90deg);width:110px;height:110px}
 .sc .tr{fill:none;stroke:var(--surface2);stroke-width:8}
-.sc .fi{fill:none;stroke-width:8;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:283;transition:stroke-dashoffset 1.5s cubic-bezier(.22,1,.36,1)}
-.sn{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-family:'Syne',sans-serif;font-size:28px;font-weight:800}
-.vb{display:inline-block;padding:6px 16px;border-radius:20px;font-family:'Syne',sans-serif;font-size:13px;font-weight:700;margin-bottom:12px}
-.sf{font-size:13px;line-height:1.7;color:#b0b0c0}
+.sc .fi{fill:none;stroke-width:8;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:283;
+  transition:stroke-dashoffset 1.5s cubic-bezier(.22,1,.36,1)}
+.sn{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  font-family:'Syne',sans-serif;font-size:28px;font-weight:800}
+.vb{display:inline-block;padding:6px 16px;border-radius:20px;font-family:'Syne',sans-serif;
+  font-size:13px;font-weight:700;margin-bottom:12px}
+.sfb{font-size:13px;line-height:1.7;color:#b0b0c0}
 .dims{display:grid;gap:12px}
 .dr{display:flex;align-items:center;gap:12px}
 .dl{font-size:11px;color:var(--muted);width:140px;flex-shrink:0;text-transform:uppercase;letter-spacing:.5px}
@@ -122,7 +259,8 @@ textarea::placeholder{color:var(--muted)}
     <div class="tp on" id="t-ai">
       <div class="panel">
         <div class="pl">Gemini Response</div>
-        <div class="ti" id="ti"><span></span><span></span><span></span><span class="lbl">Searching web & generating answer...</span></div>
+        <div class="ti" id="ti"><span></span><span></span><span></span>
+          <span class="lbl">Searching web & generating answer...</span></div>
         <div id="ac"></div>
       </div>
       <div class="panel" id="cp" style="display:none">
@@ -133,7 +271,8 @@ textarea::placeholder{color:var(--muted)}
     <div class="tp" id="t-ex">
       <div class="panel">
         <div class="pl">Your Expected Answer</div>
-        <p style="font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.7">What answer were you expecting? This will be compared against the AI's answer to generate a score.</p>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.7">
+          What answer were you expecting? This will be compared with the AI's answer to generate a score.</p>
         <textarea id="ea" placeholder="Type what you expected the AI to answer..."></textarea>
         <button class="scbtn" id="scb" onclick="doScore()" disabled>◈ Compare & Score →</button>
       </div>
@@ -145,12 +284,15 @@ textarea::placeholder{color:var(--muted)}
         <div class="sd" id="sd">
           <div class="sh">
             <div class="sc">
-              <svg viewBox="0 0 100 100"><circle class="tr" cx="50" cy="50" r="45"/><circle class="fi" id="sf" cx="50" cy="50" r="45"/></svg>
+              <svg viewBox="0 0 100 100">
+                <circle class="tr" cx="50" cy="50" r="45"/>
+                <circle class="fi" id="sf" cx="50" cy="50" r="45"/>
+              </svg>
               <div class="sn" id="snum">0</div>
             </div>
             <div style="flex:1">
               <div><span class="vb" id="vb">—</span><span class="mb" id="mb"></span></div>
-              <div class="sf" id="sfb"></div>
+              <div class="sfb" id="sfb"></div>
             </div>
           </div>
           <div class="dims" id="da"></div>
@@ -232,94 +374,33 @@ function renderScore(d){
   mb.textContent=d.matches_expected?'✓ Matches expectation':'✗ Differs from expectation';
   mb.className='mb '+(d.matches_expected?'my':'mn');
   document.getElementById('sfb').textContent=d.feedback||'';
-  const dims=[{l:'Factual Accuracy',k:'factual_accuracy',m:25},{l:'Completeness',k:'completeness',m:25},{l:'Relevance',k:'relevance',m:25},{l:'Clarity',k:'clarity',m:25}];
+  const dims=[
+    {l:'Factual Accuracy',k:'factual_accuracy',m:25},
+    {l:'Completeness',k:'completeness',m:25},
+    {l:'Relevance',k:'relevance',m:25},
+    {l:'Clarity',k:'clarity',m:25}
+  ];
   document.getElementById('da').innerHTML=dims.map(x=>{
     const v=d[x.k]||0,p=(v/x.m)*100,bc=p>=80?'#00d4aa':p>=60?'#7c6dff':p>=40?'#ffb347':'#ff4d6d';
-    return `<div class="dr"><div class="dl">${x.l}</div><div class="dbw"><div class="db" id="b-${x.k}" style="background:${bc}"></div></div><div class="ds">${v}/${x.m}</div></div>`;
+    return `<div class="dr"><div class="dl">${x.l}</div>
+      <div class="dbw"><div class="db" id="b-${x.k}" style="background:${bc}"></div></div>
+      <div class="ds">${v}/${x.m}</div></div>`;
   }).join('');
-  setTimeout(()=>dims.forEach(x=>{const e=document.getElementById('b-'+x.k);if(e)e.style.width=((d[x.k]||0)/x.m*100)+'%';}),100);
+  setTimeout(()=>dims.forEach(x=>{
+    const e=document.getElementById('b-'+x.k);
+    if(e)e.style.width=((d[x.k]||0)/x.m*100)+'%';
+  }),100);
 }
 function animN(id,s,e,dur){
   const el=document.getElementById(id),t0=performance.now();
-  (function step(n){const t=Math.min((n-t0)/dur,1);el.textContent=Math.round(s+(e-s)*(1-Math.pow(1-t,3)));if(t<1)requestAnimationFrame(step);})(t0);
+  (function step(n){
+    const t=Math.min((n-t0)/dur,1);
+    el.textContent=Math.round(s+(e-s)*(1-Math.pow(1-t,3)));
+    if(t<1)requestAnimationFrame(step);
+  })(t0);
 }
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch();});
 </script>
 </body>
 </html>"""
-
-class SearchRequest(BaseModel):
-    query: str
-
-class ScoreRequest(BaseModel):
-    query: str
-    ai_answer: str
-    expected_answer: str
-
-async def web_search(query: str) -> str:
-    params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.get(DDGO_URL, params=params)
-            data = r.json()
-            snippets = []
-            if data.get("AbstractText"):
-                snippets.append(data["AbstractText"])
-            for topic in data.get("RelatedTopics", [])[:5]:
-                if isinstance(topic, dict) and topic.get("Text"):
-                    snippets.append(topic["Text"])
-            return "\n".join(snippets) if snippets else "No web results found."
-        except Exception as e:
-            return f"Web search error: {str(e)}"
-
-async def call_gemini(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return "Error: GEMINI_API_KEY not set. Go to Vercel → Settings → Environment Variables and add it."
-    headers = {"Content-Type": "application/json"}
-    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}}
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", headers=headers, json=body)
-            data = r.json()
-            if "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            elif "error" in data:
-                return f"Gemini Error: {data['error'].get('message','Unknown')}"
-            return "No response from Gemini."
-        except Exception as e:
-            return f"Request failed: {str(e)}"
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTMLResponse(content=HTML)
-
-@app.post("/search")
-async def search(req: SearchRequest):
-    web_context = await web_search(req.query)
-    prompt = f"You are a helpful AI. Use this web context:\n{web_context}\n\nQuestion: {req.query}\n\nProvide a comprehensive, accurate answer."
-    ai_answer = await call_gemini(prompt)
-    return JSONResponse({"ai_answer": ai_answer, "web_context": web_context, "query": req.query})
-
-@app.post("/score")
-async def score(req: ScoreRequest):
-    prompt = f"""Compare the AI answer vs user's expected answer. Question: {req.query}
-AI Answer: {req.ai_answer}
-Expected: {req.expected_answer}
-Score each 0-25: Factual Accuracy, Completeness, Relevance, Clarity.
-Reply ONLY with JSON (no markdown): {{"total_score":0,"factual_accuracy":0,"completeness":0,"relevance":0,"clarity":0,"verdict":"Good","feedback":"...","matches_expected":false}}"""
-    raw = await call_gemini(prompt)
-    try:
-        clean = raw.strip()
-        if "```" in clean:
-            clean = clean.split("```")[1]
-            if clean.startswith("json"): clean = clean[4:]
-        return JSONResponse(json.loads(clean.strip()))
-    except Exception:
-        return JSONResponse({"total_score":50,"factual_accuracy":13,"completeness":13,"relevance":12,"clarity":12,"verdict":"Acceptable","feedback":"Could not parse score. Try again.","matches_expected":False})
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "gemini_configured": bool(GEMINI_API_KEY)}
-
-handler = Mangum(app)
