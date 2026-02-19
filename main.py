@@ -7,6 +7,8 @@ import os
 import json
 from pydantic import BaseModel
 from typing import Optional
+
+# Compatible with pydantic v1
 import urllib.parse
 
 app = FastAPI(title="AI Search Platform")
