@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
 DDGO_URL = "https://api.duckduckgo.com/"
 
 
