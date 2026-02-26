@@ -19,7 +19,8 @@ from urllib.parse import urlparse
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+GEMINI_MODEL = "gemini-2.0-flash-lite"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 DDGO_URL = "https://api.duckduckgo.com/"
 
 
@@ -76,7 +77,7 @@ def handle_search(body: dict) -> dict:
     ctx = web_search(query)
     prompt = f"Context: {ctx}\n\nQ: {query}\n\nAnswer in 2-3 short paragraphs. Be factual and direct."
     answer = call_gemini(prompt, max_tokens=256)
-    return {"ai_answer": answer, "web_context": ctx, "query": query}
+    return {"ai_answer": answer, "web_context": ctx, "query": query, "model": GEMINI_MODEL}
 
 
 def handle_score(body: dict) -> dict:
@@ -292,7 +293,8 @@ async function doSearch(){
     document.getElementById('ti').classList.remove('on');
     if(d.ai_answer){
       ans=d.ai_answer;
-      document.getElementById('ac').innerHTML=`<div class="badge">🤖 Gemini 2.0 Flash &nbsp;·&nbsp; 🌐 DuckDuckGo</div><div class="ans">${esc(d.ai_answer)}</div>`;
+      const modelLabel=d.model||'Gemini';
+      document.getElementById('ac').innerHTML=`<div class="badge">🤖 ${modelLabel} &nbsp;·&nbsp; 🌐 DuckDuckGo</div><div class="ans">${esc(d.ai_answer)}</div>`;
       document.getElementById('scb').disabled=false;
     }
     if(d.web_context&&d.web_context!=='No web results found.'){
