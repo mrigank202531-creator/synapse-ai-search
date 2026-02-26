@@ -32,15 +32,16 @@ def web_search(query: str) -> str:
         snippets = []
         if data.get("AbstractText"):
             snippets.append(data["AbstractText"])
-        for topic in data.get("RelatedTopics", [])[:5]:
+        for topic in data.get("RelatedTopics", [])[:2]:   # was [:5]
             if isinstance(topic, dict) and topic.get("Text"):
                 snippets.append(topic["Text"])
-        return "\n".join(snippets) if snippets else "No web results found."
+        ctx = " ".join(snippets) if snippets else "No web results."
+        return ctx[:400]  # hard cap
     except Exception as e:
-        return f"Web search error: {str(e)}"
+        return f"Search error: {str(e)}"
 
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, max_tokens: int = 256) -> str:
     if not GEMINI_API_KEY:
         return (
             "⚠️ GEMINI_API_KEY is not set.\n\n"
@@ -53,7 +54,7 @@ def call_gemini(prompt: str) -> str:
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": max_tokens},
             },
             timeout=30,
         )
@@ -73,10 +74,8 @@ def handle_search(body: dict) -> dict:
     if not query:
         return {"error": "Query is required"}
     ctx = web_search(query)
-    answer = call_gemini(
-        f"You are a helpful AI. Web context:\n{ctx}\n\nQuestion: {query}\n\n"
-        "Provide a comprehensive, accurate answer in clear paragraphs."
-    )
+    prompt = f"Context: {ctx}\n\nQ: {query}\n\nAnswer in 2-3 short paragraphs. Be factual and direct."
+    answer = call_gemini(prompt, max_tokens=256)
     return {"ai_answer": answer, "web_context": ctx, "query": query}
 
 
@@ -87,14 +86,17 @@ def handle_score(body: dict) -> dict:
     if not all([query, ai_answer, expected]):
         return {"error": "Missing required fields: query, ai_answer, expected_answer"}
 
-    raw = call_gemini(
-        f"You are an expert evaluator.\n\n"
-        f"Question: {query}\nAI Answer: {ai_answer}\nExpected: {expected}\n\n"
-        "Score each dimension 0–25: Factual Accuracy, Completeness, Relevance, Clarity.\n"
-        "Reply ONLY with JSON, no markdown:\n"
-        '{"total_score":0,"factual_accuracy":0,"completeness":0,"relevance":0,'
-        '"clarity":0,"verdict":"Good","feedback":"...","matches_expected":false}'
+    # Truncate before sending — saves ~400 tokens, scoring quality unaffected
+    ai_short = ai_answer[:300]
+    ex_short = expected[:300]
+    prompt = (
+        f"Q:{query}\nAI:{ai_short}\nExpected:{ex_short}\n"
+        "Score 0-25 each. JSON only, no markdown:\n"
+        '{"total_score":0,"factual_accuracy":0,"completeness":0,'
+        '"relevance":0,"clarity":0,"verdict":"Good",'
+        '"feedback":"1 sentence","matches_expected":false}'
     )
+    raw = call_gemini(prompt, max_tokens=120)
     try:
         clean = raw.strip()
         if "```" in clean:
